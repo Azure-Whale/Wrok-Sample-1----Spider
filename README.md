@@ -6,7 +6,7 @@ The spider will crawl items in good quality on Sephora automatically through sel
 
 To see how it works in our product, you may go to our website and take a look: https://busysquirrels.com/?category=Sephora
 
-Work Flow:
+# Workflow:
 1. The spider would initially collect item records and store them in AWS RDS, tables there would store all available items of target store
 
 2. The spider would fetch product page links from the AWS RDS I stored in step-1, and then visit these products in order to update product status as I need to track product price and availability.
