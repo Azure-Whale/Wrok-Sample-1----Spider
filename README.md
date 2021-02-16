@@ -1,4 +1,4 @@
-# Wrok-Sample-1----Spider
+# Code-Sample-1----Spider
 
 This is a small code sample of my most recent work. It is just a reference of how I write my code in working environment.
 
