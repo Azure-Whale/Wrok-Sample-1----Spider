@@ -1,0 +1,245 @@
+  
+import time
+import scrapy
+import json
+from typing import Dict
+from bs4 import BeautifulSoup as bs
+from common import SPIDER_LOG_FOLDER, create_logger
+from utils.jcpenny import *
+from scrapy_selenium import SeleniumRequest
+from selenium import webdriver
+from shutil import which
+from ..items import ProductItem
+from .base_spider import BaseInDBSpider, BaseSpider
+
+LOG = create_logger(__name__, SPIDER_LOG_FOLDER)
+_STORE_NAME = 'JCPenny'
+
+
+class JCPennyFullSpider(BaseSpider):
+    """
+    To run the spider, it requires the ChromeDrive and you should set the DRIVER_PATH after you download it
+    Command:screapy crawl sephora_spider
+    """
+
+    name = 'jcpenny_full_spider'
+    allowed_domains = ["www.jcpenney.com"]
+
+    custom_settings = {
+        'USER_AGENT': "Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/27.0.1453.93 Safari/537.36",
+        'COOKIES_ENABLED': False,
+    }
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.base_url = "https://www.jcpenney.com"
+        options = webdriver.ChromeOptions()
+        options.add_argument('headless')
+        self.headers = {
+            'user-agent': "Mozilla/5.0 (Macintosh; Intel Mac OS X 11_1_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.141 Safari/537.36"
+        }
+        custom_settings = {
+            "SELENIUM_DRIVER_EXECUTABLE_PATH": which('chromedriver')
+        }
+        self.drive = webdriver.Chrome(
+            custom_settings['SELENIUM_DRIVER_EXECUTABLE_PATH'])
+
+    def close_spider(self):
+        self.drive.quit()
+        self.drive.close()
+
+    def start_requests(self):
+        """
+        start on each main category pages and request to corresponding sub-categories
+        Request: Request to sub-category page
+        """
+
+        # get all defined main category from JC
+        main_categories = get_all_category_pages()
+        # iterate each main category to collect data from its sub-categories
+        for main in main_categories:
+            try:
+                self.drive.get(main)
+                content = self.drive.page_source
+                main_soup = bs(content, "html.parser")
+                # get hrefs from current main category
+                all_sub = main_soup.find_all(
+                    'a', {'class': "_8J0MW"},
+                    {"data-automation-id": "department-navigation-link"})
+                # iterate each sub category to collect its products
+                for sub in all_sub:
+                    yield SeleniumRequest(url=self.base_url +
+                                          sub.attrs['href'],
+                                          callback=self.parse_category,
+                                          headers=self.headers)
+            except:
+                LOG.info(
+                    'Error: Cannot handle this main category page, ignored, link: {main}'
+                )
+                continue
+
+    def parse_category(self, response):
+        """
+        Iterate all pages in a single brand and collect basic features of all products for each single page
+        
+        yield: Request to product page of each collected product
+        """
+        # use drive open current page
+        self.drive.get(response.url)
+        # get soup form current page
+        content = self.drive.page_source
+        product_soup = bs(content, "html.parser")
+        # get number of pages can be viewed in current page
+        num_pages = product_soup.select(
+            'div.font-open-sans-semibold.no-underline.w-4.text-center.cursor-pointer.text-gray-600.text-large._2F3by'
+        )
+        if not num_pages:
+            num_pages = 1
+        else:
+            num_pages = int(num_pages[-1].text)
+        # iterate each page to view all products under one brand
+        for page in range(1, num_pages + 1):
+            if page > 1:
+                self.drive.get(response.url + '&page={}'.format(page))
+            self.view_all(0.5)
+            content = self.drive.page_source
+            product_soup = bs(content, "html.parser")
+            all_products = product_soup.find_all(
+                'li', {
+                    "class": [
+                        'GU2Ri', '_1sI-J', 'flex', 'pb-1', 'pt-0', '_3G3ly',
+                        'w-1/3'
+                    ]
+                })
+
+            for product in all_products[:]:
+                try:
+                    title = product.find(
+                        'a', {"data-automation-id": "product-title"})
+                    # if the an item has no title, ignore it, otherwise collect its basic features(name, href) from title
+                    if not title:
+                        continue
+                    else:
+                        product_url = self.base_url + title.attrs['href']
+
+                    yield scrapy.Request(url=product_url,
+                                         callback=self._create_product_item,
+                                         headers=self.headers)
+                except:
+                    LOG.info(
+                        f'Cannot request product page of current subcategory, ignored, link: {response.url}'
+                    )
+                    continue
+
+    def _create_product_item(self, response):
+        """
+        Collect details of a single product
+        yield: Item
+        """
+        # load web page
+        Item = ProductItem()
+        self.drive.get(response.url)
+        time.sleep(0.75)
+        content = self.drive.page_source
+        details_soup = bs(content, "html.parser")
+        data = str(details_soup.find('script', type='application/ld+json'))
+        script_len = len("</script>")
+        js_text = data.split(
+            ">",
+            1)[1][:-script_len]  #need to scrape off all non json characters
+        product = json.loads(js_text)
+        # get basic features from title
+        try:
+            origin_cate = details_soup.find('span',
+                                            {"class": "_1Lj0B"}).get_text()
+            productID = details_soup.find('span',
+                                          {"class": "_1OWZR"}).get_text()
+            product_name = product.get('name')
+            brand_name = product['brand'].get('name')
+            rating = product['aggregateRating'].get('ratingValue')
+            reviews_cnt = product['aggregateRating'].get('reviewCount')
+            description = product.get('description')
+            image_href = product.get('image')
+            price = product['offers'][0].get('price')
+        except KeyError as e:
+            LOG.info(
+                f'Cannot handle {response.url} normally, has been ignored')
+            return
+        # deliver data to item object
+        Item['store'] = _STORE_NAME
+        Item['name'] = product_name
+        Item['href'] = response.url
+        Item['imagehref'] = image_href
+        Item['description'] = description
+        Item['productID'] = productID
+        Item['original_category'] = origin_cate
+        Item['main_category'] = get_main_category(
+            Item['original_category']
+        ) if Item['original_category'] else "others"
+        Item['brand'] = brand_name
+        Item['rating'] = rating
+        Item['price'] = price
+        Item['num_reviews'] = reviews_cnt
+        # check in stock availability (The website has both two sign, confusing)
+        out_stock = details_soup.find(
+            'p', {"data-automation-id": "getInStock"})  # get out of stock sign
+        in_stock = details_soup.find(
+            'p', {"data-automation-id": "addToCart"})  # get in stock sign
+        # if only out of stock, then unavailable, otherwise, it is in stock
+        if not in_stock and out_stock:
+            Item['in_stock'] = 0
+            Item["stock_level"] = "unavailable"
+        else:
+            Item['in_stock'] = 1
+            Item["stock_level"] = "available"
+
+        if _useful_item(Item):
+            yield Item
+        else:
+            LOG.info("Skipped low quality product: {}".format(
+                Item['productID']))
+
+    def view_all(self, SCROLL_PAUSE_TIME):
+        """
+        Go down to the botton of page
+        """
+        self.drive.execute_script(
+            "window.scrollTo(0, document.body.scrollHeight*(1/6));")
+        time.sleep(SCROLL_PAUSE_TIME)
+        self.drive.execute_script(
+            "window.scrollTo(0, document.body.scrollHeight*(2/6));")
+        time.sleep(SCROLL_PAUSE_TIME)
+        self.drive.execute_script(
+            "window.scrollTo(0, document.body.scrollHeight*(3/6));")
+        time.sleep(SCROLL_PAUSE_TIME)
+        self.drive.execute_script(
+            "window.scrollTo(0, document.body.scrollHeight*(4/6));")
+        time.sleep(SCROLL_PAUSE_TIME)
+        self.drive.execute_script(
+            "window.scrollTo(0, document.body.scrollHeight*(5/6));")
+        time.sleep(SCROLL_PAUSE_TIME)
+        self.drive.execute_script(
+            "window.scrollTo(0, document.body.scrollHeight*(6/6));")
+        time.sleep(SCROLL_PAUSE_TIME)
+
+
+def _useful_item(product):
+    return "rating" in product and product['rating'] is not None and product[
+        "rating"] >= 4 and "num_reviews" in product and product[
+            'num_reviews'] is not None and product["num_reviews"] > 50
+
+
+class JCPennyInDBSpider(JCPennyFullSpider, BaseInDBSpider):
+
+    name = 'jcpenny_in_db_spider'
+    allowed_domains = ["www.jcpenney.com/"]
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, store_name=_STORE_NAME, **kw)
+
+    def start_requests(self):
+        for url in self.url_list:
+            yield scrapy.Request(url=url, callback=self._create_product_item)
+
+    def convert_item_to_url(self, item: Dict):
+        return item["href"]
